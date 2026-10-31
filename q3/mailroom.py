@@ -285,6 +285,7 @@ def verify_receipt_signature(verifier_jwk: Dict[str, Any], message_bytes: bytes,
 
 # --- Unified Public Route ---
 
+@app.post("")
 @app.post("/")
 async def mailroom_endpoint(request: Request):
     try:
