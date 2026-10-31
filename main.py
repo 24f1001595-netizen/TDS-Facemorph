@@ -14,7 +14,7 @@ from q3.mailroom import app as q3_app                   # q3/mailroom.py
 from q4.incident_agent import app as q4_app             # q4/incident_agent.py
 
 # Create the top-level unified server
-app = FastAPI(title="TDS GA3 Combined Service")
+app = FastAPI(title="TDS GA3 Combined Service", redirect_slashes=False)
 
 # 1. Q2 Origin Discovery: Grader strictly checks GET /.well-known/agent-card.json at root origin
 @app.get("/.well-known/agent-card.json")
