@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Observable Incident Triage Agent")
@@ -18,7 +18,6 @@ RUNS: Dict[str, Dict[str, Any]] = {}
 TRANSCRIPT_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def canonical_json_bytes(obj: Any) -> bytes:
-    """Recursively key-sorted compact JSON encoding."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 def sha256_hex(data: bytes) -> str:
@@ -27,19 +26,19 @@ def sha256_hex(data: bytes) -> str:
 def random_hex(num_bytes: int) -> str:
     return os.urandom(num_bytes).hex().lower()
 
-# --- Health check probe ---
 @app.get("/")
 def health_check():
     return {"ok": True, "profile": PROFILE}
 
-# --- Deterministic & AI Diagnosis Engine ---
+# --- Diagnostic & Argument Planner ---
 
-def extract_diagnosis_and_plan(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]]) -> Dict[str, Any]:
+def plan_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
     transcript = incident.get("transcript", "")
     allowed_causes = incident.get("allowedRootCauses", [])
     service = incident.get("service", "core-api")
+    effect_tools = set(policy.get("effectTools", ["rollback_deployment", "disable_feature", "scale_service"]))
 
-    # Extract all evidence tags: [ev_...]
+    # Extract [ev_...] tags and line text
     evidence_matches = re.findall(r'\[(ev_[a-zA-Z0-9_\-]+)\]\s*([^\n]+)', transcript)
     
     t_hash = sha256_hex(transcript.encode("utf-8"))
@@ -50,43 +49,55 @@ def extract_diagnosis_and_plan(incident: Dict[str, Any], tool_catalog: List[Dict
     chosen_cause = allowed_causes[0] if allowed_causes else "unknown_anomaly"
     matching_evidence: List[str] = []
 
-    # Match cause keywords to transcript evidence lines
+    # Score each allowed root cause against evidence lines
+    best_score = -1
     for cause in allowed_causes:
-        keywords = cause.replace("_", " ").split()
-        hits = [ev_id for ev_id, text in evidence_matches if any(k.lower() in text.lower() for k in keywords)]
-        if len(hits) >= 2:
+        kw_list = cause.replace("_", " ").split()
+        hits = [ev_id for ev_id, text in evidence_matches if any(k.lower() in text.lower() for k in kw_list)]
+        if len(hits) > best_score:
+            best_score = len(hits)
             chosen_cause = cause
-            matching_evidence = hits[:3]
-            break
+            matching_evidence = list(dict.fromkeys(hits))
 
     if len(matching_evidence) < 2:
-        matching_evidence = [e[0] for e in evidence_matches[:2]] if len(evidence_matches) >= 2 else ["ev_init_1", "ev_init_2"]
+        matching_evidence = [e[0] for e in evidence_matches[:3]] if len(evidence_matches) >= 2 else ["ev_init_1", "ev_init_2"]
 
-    # Select 1 diagnostic tool from catalog
-    diag_tools = [t for t in tool_catalog if any(k in t.get("name", "") for k in ("query", "check", "metric", "inspect", "status", "health"))]
-    selected_tool = diag_tools[0] if diag_tools else (tool_catalog[0] if tool_catalog else {"name": "query_metrics", "inputSchema": {}})
+    # Select strictly from diagnostic tools (tools NOT in effectTools)
+    diag_candidates = [t for t in tool_catalog if t.get("name") not in effect_tools]
+    if not diag_candidates:
+        diag_candidates = tool_catalog
 
-    # Populate arguments strictly fulfilling required fields in inputSchema
-    tool_name = selected_tool.get("name", "query_metrics")
+    selected_tool = diag_candidates[0]
+    t_name = selected_tool.get("name", "query_metrics")
     schema = selected_tool.get("inputSchema", {})
-    required_fields = schema.get("required", [])
-    args = {}
-    for f in required_fields:
-        if "service" in f.lower():
-            args[f] = service
-        elif "query" in f.lower() or "metric" in f.lower() or "name" in f.lower():
-            args[f] = chosen_cause
-        else:
-            args[f] = "default"
+    req_fields = schema.get("required", [])
+    properties = schema.get("properties", {})
 
-    if not args:
-        args = {"service": service}
+    tool_args = {}
+    for f in req_fields:
+        prop = properties.get(f, {})
+        p_type = prop.get("type", "string")
+        if "service" in f.lower():
+            tool_args[f] = service
+        elif any(k in f.lower() for k in ("query", "metric", "filter", "cause")):
+            tool_args[f] = chosen_cause
+        elif p_type in ("integer", "number"):
+            tool_args[f] = 60
+        elif p_type == "boolean":
+            tool_args[f] = True
+        elif p_type == "array":
+            tool_args[f] = [service]
+        else:
+            tool_args[f] = service
+
+    if not tool_args and "service" in properties:
+        tool_args["service"] = service
 
     plan = {
         "rootCause": chosen_cause,
-        "evidence": matching_evidence,  # 2 to 4 items
-        "diagTool": tool_name,
-        "arguments": args,
+        "evidence": matching_evidence[:4],  # strictly 2 to 4 unique IDs
+        "toolName": t_name,
+        "arguments": tool_args,
         "service": service
     }
 
@@ -101,19 +112,18 @@ async def create_incident(request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        raise HTTPException(status_code=400, detail="Malformed JSON")
 
     if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+        raise HTTPException(status_code=400, detail="Expected JSON object")
 
-    # Profile validation probe (expected 400)
     if body.get("profile") != PROFILE:
         raise HTTPException(status_code=400, detail=f"Unsupported profile: {body.get('profile')}")
 
     run_id = body.get("runId")
     incident_data = body.get("incident")
     if not run_id or not incident_data or not isinstance(incident_data, dict):
-        raise HTTPException(status_code=422, detail="Missing required incident attributes")
+        raise HTTPException(status_code=422, detail="Missing runId or incident")
 
     body_bytes = canonical_json_bytes(body)
     body_hash = sha256_hex(body_bytes)
@@ -121,13 +131,11 @@ async def create_incident(request: Request):
     with LOCK:
         if run_id in RUNS:
             existing = RUNS[run_id]
-            # Idempotency conflict probe (expected 409 on changed body)
             if existing["body_hash"] != body_hash:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="runId content conflict")
-            # Exact replay: return saved initial response
             return JSONResponse(status_code=200, content=existing["initial_response"])
 
-    # W3C Trace context handling
+    # W3C Traceparent handling
     incoming_tp = request.headers.get("traceparent")
     incoming_ts = request.headers.get("tracestate")
     if incoming_tp and re.match(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$", incoming_tp):
@@ -144,29 +152,28 @@ async def create_incident(request: Request):
     policy = body.get("policy", {})
     public_marker = body.get("publicMarker", "marker-safe")
 
-    plan = extract_diagnosis_and_plan(incident_data, tool_catalog)
+    plan = plan_incident(incident_data, tool_catalog, policy)
 
-    action_id = f"act_{random_hex(6)}"
-    call_id = f"call_{random_hex(6)}"
+    action_id = f"act_{random_hex(6)}"  # >= 8 characters
+    call_id = f"call_{random_hex(6)}"   # >= 8 characters
     diag_evidence = plan["evidence"]
 
-    # Traceparent for dispatch uses the CLIENT span ID
     traceparent = f"00-{trace_id}-{client_span_id}-01"
 
     diag_dispatch = {
         "actionId": action_id,
         "callId": call_id,
         "phase": "diagnostic",
-        "toolName": plan["diagTool"],
+        "toolName": plan["toolName"],
         "arguments": plan["arguments"],
-        "evidence": [diag_evidence[0]],  # strict subset of diagnosis.evidence
+        "evidence": [diag_evidence[0]],  # non-empty subset of diagnosis.evidence
         "attempt": 1,
         "traceparent": traceparent
     }
     if incoming_ts:
         diag_dispatch["tracestate"] = incoming_ts
 
-    # Contract response for status waiting (strictly no actionLog/receiptLog here)
+    # Strict contract schema for status: "waiting" (no actionLog/receiptLog here)
     initial_response = {
         "runId": run_id,
         "status": "waiting",
@@ -217,7 +224,7 @@ async def handle_receipts(runId: str, request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
     receipt_id = body.get("receiptId")
     if not receipt_id:
@@ -234,7 +241,7 @@ async def handle_receipts(runId: str, request: Request):
                 return JSONResponse(status_code=200, content=state["terminal_response"])
         state["receipt_hashes"][receipt_id] = body_hash
 
-    # 1. Approval receipt handling
+    # 1. Handle Approvals
     approvals_in = body.get("approvals", [])
     if approvals_in:
         for apprv in approvals_in:
@@ -282,7 +289,7 @@ async def handle_receipts(runId: str, request: Request):
                     "approvals": []
                 })
 
-    # 2. Tool outcomes handling
+    # 2. Handle Tool Outcomes
     outcomes = body.get("outcomes", [])
     retries_to_send = []
     timed_out = False
@@ -331,7 +338,7 @@ async def handle_receipts(runId: str, request: Request):
         state["terminal_response"] = final_resp
         return JSONResponse(status_code=200, content=final_resp)
 
-    # Check policy approval requirements
+    # Check approval requirement
     approval_needed_for = state["policy"].get("approvalRequiredFor", ["rollback_deployment", "disable_feature"])
     preferred_effect = "rollback_deployment" if "rollback_deployment" in [t.get("name") for t in state["tool_catalog"]] else "scale_service"
 
@@ -373,8 +380,14 @@ async def get_incident(runId: str):
     if state["status"] in ("completed", "failed") and state["terminal_response"]:
         return JSONResponse(status_code=200, content=state["terminal_response"])
 
-    # If the run is still in waiting state during the probe phase:
-    return JSONResponse(status_code=200, content=state["initial_response"])
+    # For ongoing/waiting probe inspection, mandatory logs must be present:
+    return JSONResponse(status_code=200, content={
+        "runId": runId,
+        "status": state["status"],
+        "diagnosis": state["diagnosis"],
+        "actionLog": state["action_log"],
+        "receiptLog": state["receipt_log"]
+    })
 
 # --- OTLP Trace Hierarchy Builder ---
 
