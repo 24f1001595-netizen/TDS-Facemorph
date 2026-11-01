@@ -12,9 +12,6 @@ from google.genai import types
 
 app = FastAPI(title="A2A Invoice Agent")
 
-# Environment & Config
-AGENT_BASE_URL = "https://sensitive-recorders-remedy-toolkit.trycloudflare.com"
-GEMINI_API_KEY = "AIzaSyBvVnsB-JK4iYwHIsXc8bpr4ATEicOA5KQ"
 
 # In-Memory Storage & Thread Safety
 STORE_LOCK = threading.Lock()
